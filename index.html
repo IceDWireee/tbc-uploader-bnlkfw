@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TBC ZIP Uploader</title>
+<style>
+body{font:16px -apple-system,system-ui,sans-serif;margin:0;padding:16px;background:#0f1115;color:#e8eaed}
+h1{font-size:20px;margin:0 0 6px}
+.sub{font-size:13px;color:#8b95a5;margin-bottom:14px;line-height:1.4}
+label{display:block;margin:12px 0 5px;font-size:13px;color:#9aa4b2}
+input{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;border:1px solid #2b3444;background:#161a22;color:#e8eaed;font-size:16px}
+button{width:100%;padding:15px;margin-top:18px;border:0;border-radius:12px;background:#2f6fed;color:#fff;font-size:17px;font-weight:600}
+button:disabled{opacity:.5}
+pre{white-space:pre-wrap;word-break:break-word;background:#10151d;border:1px solid #232b39;border-radius:10px;padding:12px;font-size:13px;margin-top:16px;max-height:44vh;overflow:auto}
+.note{font-size:12px;color:#8b95a5;margin-top:16px;line-height:1.55}
+</style>
+</head>
+<body>
+<h1>Загрузка ZIP в GitHub</h1>
+<div class="sub">Большой архив режется на части по 8 MB и уходит прямо в твой приватный репозиторий. Обрыв связи не страшен: загруженные части сохраняются.</div>
+<label>Токен GitHub</label>
+<input id="tok" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ghp_... или github_pat_...">
+<label>Владелец (owner)</label>
+<input id="own" autocapitalize="off" spellcheck="false">
+<label>Репозиторий</label>
+<input id="rep" autocapitalize="off" spellcheck="false">
+<label>Ветка</label>
+<input id="br" value="main" autocapitalize="off" spellcheck="false">
+<label>ZIP из приложения «Файлы»</label>
+<input id="f" type="file" accept=".zip,application/zip,application/x-zip-compressed">
+<button id="btn">Загрузить</button>
+<pre id="log"></pre>
+<div class="note">Токен живёт только в памяти этой страницы и отправляется исключительно на api.github.com. Он не пишется в адрес, в лог и на сторонние серверы. Нужны права Contents: Read and write на этот репозиторий.</div>
+<script>
+var TOKEN = '';
+var OWNER = '';
+var REPO = '';
+var BR = 'main';
+var CH = 8 * 1024 * 1024;
+
+function el(i) { return document.getElementById(i); }
+function nl() { return String.fromCharCode(10); }
+function say(t) { var a = el('log'); a.textContent = a.textContent + t + nl(); a.scrollTop = a.scrollHeight; }
+function pad(n) { var s = String(n); while (s.length < 3) { s = '0' + s; } return s; }
+function mb(n) { return (n / 1048576).toFixed(2) + ' MB'; }
+
+function b64(u8) {
+  var s = '';
+  var step = 8192;
+  for (var i = 0; i < u8.length; i += step) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+  }
+  return btoa(s);
+}
+
+function hex(buf) {
+  return crypto.subtle.digest('SHA-256', buf).then(function (d) {
+    var a = new Uint8Array(d);
+    var o = '';
+    for (var i = 0; i < a.length; i++) {
+      o += ('0' + a[i].toString(16)).slice(-2);
+    }
+    return o;
+  });
+}
+
+function gh(path, method, body) {
+  var opt = {
+    method: method || 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + TOKEN,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    }
+  };
+  if (body) { opt.body = JSON.stringify(body); }
+  return fetch('https://api.github.com' + path, opt).then(function (r) {
+    return r.text().then(function (t) {
+      var j = null;
+      try { j = JSON.parse(t); } catch (e) { j = null; }
+      return { s: r.status, j: j };
+    });
+  });
+}
+
+function sleep(ms) {
+  return new Promise(function (z) { setTimeout(z, ms); });
+}
+
+function putFile(path, content, msg) {
+  var attempt = 0;
+  function once() {
+    return gh('/repos/' + OWNER + '/' + REPO + '/contents/' + path, 'PUT', {message: msg, content: content, branch: BR}).then(function (res) {
+      if (res.s < 300) { return true; }
+      if (res.s === 422 || res.s === 409) {
+        return gh('/repos/' + OWNER + '/' + REPO + '/contents/' + path + '?ref=' + BR).then(function (g) {
+          if (g.s === 200 && g.j && g.j.sha) {
+            return gh('/repos/' + OWNER + '/' + REPO + '/contents/' + path, 'PUT', {message: msg, content: content, branch: BR, sha: g.j.sha}).then(function (r2) {
+              return r2.s < 300;
+            });
+          }
+          return false;
+        });
+      }
+      say('  GitHub ответил ' + res.s + (res.j && res.j.message ? ' · ' + res.j.message : ''));
+      if (res.s === 401) { say('  Токен неверный или просрочен.'); return false; }
+      if (res.s === 403) { say('  Нет прав на запись. Проверь scope Contents.'); return false; }
+      if (res.s === 404) { say('  Репозиторий или ветка не найдены. Проверь owner/repo/ветку.'); return false; }
+      return false;
+    });
+  }
+  function retry() {
+    attempt = attempt + 1;
+    if (attempt > 3) { return Promise.resolve(false); }
+    return sleep(1200 * attempt).then(function () {
+      say('  повтор ' + attempt + '/3');
+      return once().then(function (ok) { if (ok) { return true; } return retry(); });
+    });
+  }
+  return once().then(function (ok) {
+    if (ok) { return true; }
+    return retry();
+  }).catch(function (e) {
+    say('  сеть: ' + e);
+    return false;
+  });
+}
+
+function existingParts() {
+  return gh('/repos/' + OWNER + '/' + REPO + '/contents/parts?ref=' + BR).then(function (res) {
+    var m = {};
+    if (res.s === 200 && res.j && res.j.length) {
+      for (var i = 0; i < res.j.length; i++) {
+        var it = res.j[i];
+        if (it && it.name && it.name.indexOf('.bin') > 0) { m[it.name] = it.size; }
+      }
+    }
+    return m;
+  }).catch(function () { return {}; });
+}
+
+function run() {
+  TOKEN = el('tok').value.trim();
+  OWNER = el('own').value.trim();
+  REPO = el('rep').value.trim();
+  BR = el('br').value.trim() || 'main';
+  var f = el('f').files[0];
+  if (!TOKEN || !OWNER || !REPO) { say('Заполни токен, owner и repo.'); return; }
+  if (!f) { say('Выбери ZIP из «Файлы».'); return; }
+  el('btn').disabled = true;
+  say('Файл: ' + f.name);
+  say('Размер: ' + mb(f.size));
+  if (f.size < 22) { say('Файл слишком мал для ZIP. Остановлено.'); el('btn').disabled = false; return; }
+  var total = Math.ceil(f.size / CH);
+  say('Частей: ' + total + ' по 8 MB');
+  f.slice(0, 2).arrayBuffer().then(function (hb) {
+    var h = new Uint8Array(hb);
+    if (h[0] !== 80 || h[1] !== 75) {
+      say('Это не ZIP: нет сигнатуры PK. Остановлено.');
+      el('btn').disabled = false;
+      return null;
+    }
+    say('Сигнатура ZIP: ок');
+    return existingParts();
+  }).then(function (have) {
+    if (have === null) { return null; }
+    var keys = Object.keys(have);
+    say('Уже загружено частей: ' + keys.length);
+    var man = [];
+    var chain = Promise.resolve(true);
+    var km = function (i) {
+      chain = chain.then(function (keep) {
+        if (!keep) { return false; }
+        if (i >= total) { return true; }
+        var name = 'part_' + pad(i) + '.bin';
+        var start = i * CH;
+        var end = Math.min(f.size, start + CH);
+        return f.slice(start, end).arrayBuffer().then(function (buf) {
+          var u8 = new Uint8Array(buf);
+          return hex(buf).then(function (hh) {
+            man.push(hh + '  ' + name);
+            if (have[name] === u8.length) {
+              say((i + 1) + '/' + total + ' ' + name + ' уже есть, пропуск');
+              return km(i + 1);
+            }
+            return putFile('parts/' + name, b64(u8), 'Add ' + name).then(function (ok) {
+              say((i + 1) + '/' + total + ' ' + name + ' ' + (ok ? 'загружено' : 'ОШИБКА') + ' · ' + mb(u8.length));
+              if (!ok) { return false; }
+              return km(i + 1);
+            });
+          });
+        });
+      });
+      return chain;
+    };
+    return km(0).then(function (ok) {
+      if (!ok) {
+        say('Прервано. Нажми «Загрузить» снова — принятые части сохранятся.');
+        el('btn').disabled = false;
+        return null;
+      }
+      var body = man.join(nl()) + nl();
+      return putFile('parts/expected_size.txt', b64(new TextEncoder().encode(String(f.size))), 'Add total size').then(function (m2) {
+        say('Ожидаемый размер: ' + (m2 ? 'записан' : 'ОШИБКА'));
+        return putFile('parts/manifest.sha256', b64(new TextEncoder().encode(body)), 'Add parts manifest').then(function (m1) {
+          say('Манифест SHA-256: ' + (m1 ? 'записан' : 'ОШИБКА'));
+          if (!m1) {
+            say('Манифест не записался — сборка не стартует. Нажми «Загрузить» ещё раз, части уже на месте.');
+            el('btn').disabled = false;
+            return;
+          }
+          say('Готово. Сборка стартует сама, обычно через 1-2 минуты.');
+          say('Вернись в бота и нажми «Получить результат» (/c_get).');
+          el('btn').disabled = false;
+        });
+      });
+    });
+  }).catch(function (e) {
+    say('Ошибка: ' + e);
+    say('Нажми «Загрузить» снова, чтобы продолжить.');
+    el('btn').disabled = false;
+  });
+}
+
+var q = new URLSearchParams(location.search);
+if (q.get('o')) { el('own').value = q.get('o'); }
+if (q.get('r')) { el('rep').value = q.get('r'); }
+if (q.get('b')) { el('br').value = q.get('b'); }
+el('btn').addEventListener('click', run);
+</script>
+</body>
+</html>
